@@ -449,6 +449,7 @@
             <i class="ph-bold ph-webcam text-emerald-400 text-lg"></i>
 
             <h3 class="font-bold text-sm text-slate-200">AI Pose 即時影像辨識</h3>
+            <span id="cameraVersionTag" class="ml-2 rounded-md bg-emerald-500/15 px-2 py-0.5 text-[10px] font-bold text-emerald-300">CAMERA FIX V2</span>
 
           </div>
 
@@ -464,11 +465,11 @@
 
         <!-- Webcam Container -->
 
-        <div class="relative w-full aspect-video bg-black/60 rounded-xl overflow-hidden border border-slate-700 flex items-center justify-center">
+        <div class="relative w-full aspect-square max-h-[430px] mx-auto bg-black/60 rounded-xl overflow-hidden border border-slate-700 flex items-center justify-center">
 
-          <canvas id="poseCanvas" class="w-full h-full object-cover"></canvas>
-
-
+          <!-- Show the REAL camera video independently of AI inference, so errors never make it black. -->
+          <video id="cameraVideo" autoplay muted playsinline class="hidden absolute inset-0 w-full h-full object-cover" style="transform: scaleX(-1);"></video>
+          <canvas id="poseCanvas" width="300" height="300" class="absolute inset-0 w-full h-full object-cover pointer-events-none"></canvas>
 
           <!-- Skeleton overlay canvas -->
 
@@ -481,6 +482,8 @@
           </div>
 
 
+
+          <div id="cameraErrorText" class="hidden absolute bottom-2 left-2 right-2 px-3 py-2 text-xs rounded-lg bg-red-950/90 border border-red-400/50 text-red-200 z-10 break-words"></div>
 
           <!-- Active Target Lane Overlay Badge -->
 
@@ -960,11 +963,21 @@
 
     let model = null;
 
-    let webcam = null;
-
+    // Use native getUserMedia + visible <video> rather than a hidden TM webcam canvas.
+    // The image remains visible even if model inference throws.
+    const CAMERA_SIZE = 300;
+    const cameraVideo = document.getElementById('cameraVideo');
+    const modelInputCanvas = document.createElement('canvas');
+    modelInputCanvas.width = CAMERA_SIZE;
+    modelInputCanvas.height = CAMERA_SIZE;
+    const modelInputCtx = modelInputCanvas.getContext('2d');
+    let cameraStream = null;
+    let cameraFrameId = null;
+    let cameraSession = 0;
+    let cameraToggleBusy = false;
     let poseCtx = null;
-
     let isWebcamActive = false;
+    let inferErrorShown = false;
 
     let currentPose = 'Mid'; // Default starting active lane pose
 
@@ -1038,93 +1051,95 @@
 
 
 
-    async function toggleWebcam() {
-
-      const btn = document.getElementById('toggleWebcamBtn');
-
-      const placeholder = document.getElementById('camPlaceholder');
-
-
-
-      if (isWebcamActive) {
-
-        // Turn Off
-
-        if (webcam) {
-
-          await webcam.stop();
-
-        }
-
-        isWebcamActive = false;
-
-        btn.textContent = '開啟鏡頭';
-
-        placeholder.classList.remove('hidden');
-
-        return;
-
-      }
-
-
-
-      if (!model) {
-
-        alert("AI 模型尚未完成載入，請稍候...");
-
-        return;
-
-      }
-
-
-
-      try {
-
-        btn.textContent = '啟動中...';
-
-        const size = 300;
-
-        const flip = true; // mirror
-
-        webcam = new tmPose.Webcam(size, size, flip);
-
-        await webcam.setup();
-
-        await webcam.play();
-
-        window.requestAnimationFrame(webcamLoop);
-
-
-
-        isWebcamActive = true;
-
-        btn.textContent = '關閉鏡頭';
-
-        placeholder.classList.add('hidden');
-
-
-
-        // Match canvas dimensions
-
-        poseCanvas.width = size;
-
-        poseCanvas.height = size;
-
-        poseCtx = poseCanvas.getContext('2d');
-
-      } catch (err) {
-
-        console.error("Webcam access error:", err);
-
-        alert("無法讀取視訊鏡頭，請確認權限或改用下方手動按鈕操控！");
-
-        btn.textContent = '開啟鏡頭';
-
-      }
-
+    function showCameraError(message) {
+      const el = document.getElementById('cameraErrorText');
+      el.textContent = message;
+      el.classList.remove('hidden');
     }
 
+    function hideCameraError() {
+      const el = document.getElementById('cameraErrorText');
+      el.textContent = '';
+      el.classList.add('hidden');
+    }
 
+    function stopCamera() {
+      cameraSession++;
+      isWebcamActive = false;
+      if (cameraFrameId !== null) {
+        cancelAnimationFrame(cameraFrameId);
+        cameraFrameId = null;
+      }
+      if (cameraStream) {
+        cameraStream.getTracks().forEach(track => track.stop());
+        cameraStream = null;
+      }
+      cameraVideo.pause();
+      cameraVideo.srcObject = null;
+      cameraVideo.classList.add('hidden');
+      document.getElementById('camPlaceholder').classList.remove('hidden');
+      document.getElementById('toggleWebcamBtn').textContent = '開啟鏡頭';
+      if (poseCtx) poseCtx.clearRect(0, 0, CAMERA_SIZE, CAMERA_SIZE);
+      updateConfidenceUI({ Left: 0, Mid: 0, Right: 0 });
+      hideCameraError();
+    }
+
+    async function toggleWebcam() {
+      if (cameraToggleBusy) return;
+      cameraToggleBusy = true;
+      const btn = document.getElementById('toggleWebcamBtn');
+      try {
+        if (isWebcamActive) {
+          stopCamera();
+          return;
+        }
+        if (!model) {
+          showCameraError('AI 模型還沒載入完成，請先確認模型網址與網路連線。');
+          return;
+        }
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+          showCameraError('瀏覽器不支援或未授權攝影機。請用 Chrome 開啟 localhost 網頁並確認相機權限。');
+          return;
+        }
+        hideCameraError();
+        btn.textContent = '啟動中...';
+        cameraStream = await navigator.mediaDevices.getUserMedia({
+          audio: false,
+          video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } }
+        });
+        cameraVideo.srcObject = cameraStream;
+        await cameraVideo.play();
+        if (!cameraVideo.videoWidth || !cameraVideo.videoHeight) {
+          await new Promise((resolve, reject) => {
+            const timer = setTimeout(() => reject(new Error('相機未產生影像，請關閉其他占用攝影機的程式。')), 4000);
+            cameraVideo.addEventListener('loadeddata', () => { clearTimeout(timer); resolve(); }, { once: true });
+          });
+        }
+        const canvas = document.getElementById('poseCanvas');
+        canvas.width = CAMERA_SIZE;
+        canvas.height = CAMERA_SIZE;
+        poseCtx = canvas.getContext('2d');
+        inferErrorShown = false;
+        isWebcamActive = true;
+        cameraSession++;
+        cameraVideo.classList.remove('hidden');
+        document.getElementById('camPlaceholder').classList.add('hidden');
+        btn.textContent = '關閉鏡頭';
+        cameraFrameId = requestAnimationFrame(() => webcamLoop(cameraSession));
+      } catch (err) {
+        console.error('Camera startup failed:', err);
+        stopCamera();
+        const cameraHint = err.name === 'NotAllowedError'
+          ? '攝影機權限遭拒，請點網址列左邊的網站設定允許相機。'
+          : err.name === 'NotFoundError'
+          ? '找不到攝影機，請檢查鏡頭是否已連接。'
+          : '鏡頭開啟失敗：' + (err.message || String(err));
+        showCameraError(cameraHint);
+      } finally {
+        cameraToggleBusy = false;
+        if (!isWebcamActive) btn.textContent = '開啟鏡頭';
+      }
+    }
 
     async function reloadCustomModel() {
 
@@ -1140,53 +1155,54 @@
 
 
 
-    async function webcamLoop(timestamp) {
-
-      if (isWebcamActive && webcam) {
-
-        webcam.update();
-
-        await predictPose();
-
-        window.requestAnimationFrame(webcamLoop);
-
+    async function webcamLoop(session) {
+      if (!isWebcamActive || session !== cameraSession) return;
+      try {
+        // Render the camera BEFORE inference, not after; mirrored just like TM webcam.
+        if (cameraVideo.readyState >= 2 && cameraVideo.videoWidth > 0) {
+          const w = cameraVideo.videoWidth;
+          const h = cameraVideo.videoHeight;
+          const crop = Math.min(w, h);
+          modelInputCtx.save();
+          modelInputCtx.translate(CAMERA_SIZE, 0);
+          modelInputCtx.scale(-1, 1);
+          modelInputCtx.drawImage(cameraVideo, (w - crop) / 2, (h - crop) / 2,
+              crop, crop, 0, 0, CAMERA_SIZE, CAMERA_SIZE);
+          modelInputCtx.restore();
+          await predictPose();
+          if (inferErrorShown) {
+            hideCameraError();
+            inferErrorShown = false;
+            document.getElementById('aiStatusText').textContent = 'AI 模型就緒 (Ready)';
+          }
+        }
+      } catch (err) {
+        // Keep the video and loop alive when one inference frame fails.
+        if (!inferErrorShown) console.error('AI pose inference failed:', err);
+        inferErrorShown = true;
+        showCameraError('鏡頭已開啟，但 AI 辨識失敗：' + (err.message || String(err)));
+        document.getElementById('aiStatusText').textContent = 'AI 辨識異常（鏡頭正常）';
+      } finally {
+        if (isWebcamActive && session === cameraSession) {
+          cameraFrameId = requestAnimationFrame(() => webcamLoop(session));
+        }
       }
-
     }
 
-
-
     async function predictPose() {
-
-      if (!model || !webcam) return;
-
-
-
-      const { pose, posenetOutput } = await model.estimatePose(webcam.canvas);
-
+      if (!model || !isWebcamActive) return;
+      const { pose, posenetOutput } = await model.estimatePose(modelInputCanvas);
       const prediction = await model.predict(posenetOutput);
 
-
-
-      // Render Skeleton on Pose Canvas
-
+      // Pose skeleton is an overlay only; the live video stays independently visible.
       if (poseCtx) {
-
-        poseCtx.drawImage(webcam.canvas, 0, 0);
-
-        if (pose) {
-
+        poseCtx.clearRect(0, 0, CAMERA_SIZE, CAMERA_SIZE);
+        if (pose && pose.keypoints) {
           const minPartConfidence = 0.5;
-
           tmPose.drawKeypoints(pose.keypoints, minPartConfidence, poseCtx);
-
           tmPose.drawSkeleton(pose.keypoints, minPartConfidence, poseCtx);
-
         }
-
       }
-
-
 
       // Map predictions to probabilities
 
@@ -1198,18 +1214,21 @@
 
         const name = p.className.trim();
 
-        if (name.toLowerCase().includes('left')) probMap['Left'] = p.probability;
-
-        else if (name.toLowerCase().includes('mid')) probMap['Mid'] = p.probability;
-
-        else if (name.toLowerCase().includes('right')) probMap['Right'] = p.probability;
+        const label = name.toLowerCase();
+        if (label.includes('left') || name.includes('左')) probMap['Left'] = p.probability;
+        else if (label.includes('mid') || label.includes('center') || label.includes('centre') || name.includes('中')) probMap['Mid'] = p.probability;
+        else if (label.includes('right') || name.includes('右')) probMap['Right'] = p.probability;
 
       });
 
 
 
+      // Surface unmatched class names, instead of silently displaying three 0% bars.
+      if (prediction.length && Object.values(probMap).every(v => v === 0)) {
+        showCameraError('模型類別名稱無法對應 Left / Mid / Right：' +
+          prediction.map(p => p.className).join(', ') + '。請檢查訓練時的 Class 名稱。');
+      }
       // Update UI Confidence Bars
-
       updateConfidenceUI(probMap);
 
 
